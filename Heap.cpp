@@ -1,122 +1,121 @@
-/**
- * Copyright (c) Facebook, Inc. and its affiliates.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
+#include "infer_yellow.hpp"
+#include <opencv2/opencv.hpp>
+#include <iostream>
 
-// -*- c++ -*-
-
-/* Function for soft heap */
-
-#include "Heap.h"
-
-
-namespace faiss {
-
-
-template <typename C>
-void HeapArray<C>::heapify ()
+using namespace std;
+using namespace yellow;
+//Get all image name
+bool getImageName(const char *fileName, vector<string> &imageName)
 {
-#pragma omp parallel for
-    for (size_t j = 0; j < nh; j++)
-        heap_heapify<C> (k, val + j * k, ids + j * k);
+    FILE *f = fopen(fileName, "r");
+    if (f == NULL)
+        return false;
+    char buffer[300];
+    while (fgets(buffer, 300, f))
+    {
+        //Cut '\n'
+        int len = strlen(buffer);
+        if(buffer[len - 1] == '\n')
+            buffer[strlen(buffer) - 1] = '\0';
+        imageName.push_back(string(buffer));
+    }
+    fclose(f);
+    return true;
 }
 
-template <typename C>
-void HeapArray<C>::reorder ()
+int main(int argc, char const *argv[]) 
 {
-#pragma omp parallel for
-    for (size_t j = 0; j < nh; j++)
-        heap_reorder<C> (k, val + j * k, ids + j * k);
-}
 
-template <typename C>
-void HeapArray<C>::addn (size_t nj, const T *vin, TI j0,
-                         size_t i0, long ni)
-{
-    if (ni == -1) ni = nh;
-    assert (i0 >= 0 && i0 + ni <= nh);
-#pragma omp parallel for
-    for (size_t i = i0; i < i0 + ni; i++) {
-        T * __restrict simi = get_val(i);
-        TI * __restrict idxi = get_ids (i);
-        const T *ip_line = vin + (i - i0) * nj;
+    if(argc<4)
+    {
+        std::cout<<"error : miss some models."<<endl;
+        return 0;
+    }
+    //output the models of inputs
+    for(int i=1;i<argc;i++)
+    {
+        std::cout<<argv[i]<<std::endl;
+    }
+    //the batch of model
+    const int batch = 8;
+    std::vector<std::string> models;
+    //u can load multi models
+    {
+        models.push_back(argv[1]);
+        models.push_back(argv[2]);
+        models.push_back(argv[3]);
+    }
 
-        for (size_t j = 0; j < nj; j++) {
-            T ip = ip_line [j];
-            if (C::cmp(simi[0], ip)) {
-                heap_pop<C> (k, simi, idxi);
-                heap_push<C> (k, simi, idxi, ip, j + j0);
+    int code = -1;
+    char *err = nullptr;
+    int gpuid = 0;
+    // Do createNet
+    auto *handle = createNet(models, gpuid, &code, &err);
+
+    if (code == 200) 
+    {   
+        vector<string> imageName;
+        // Judge images can be open
+        if (!getImageName("../images/file.txt", imageName))
+        {
+            cerr << "Can't open image" << endl;
+        }
+        int num_times = imageName.size()/batch;
+
+        //deal with the images not matches
+        bool full_batch=true;
+        if(num_times*batch!=imageName.size())
+        {
+            num_times++;
+            full_batch=false;
+        }
+        //Get the image number of each inference 
+        int each_time_images=batch;
+        //Do inference
+        for (int i = 0; i < num_times; ++i) 
+        {
+            // Read image from file to bytes
+            vector<cv::Mat> imgs;
+            //Get image index of each inference.
+            
+            if(!full_batch && i==num_times-1)
+                each_time_images=imageName.size()%batch;
+            for (int n = 0; n < each_time_images; n++) 
+            {
+                string name = imageName[i * batch + n];
+                cv::Mat img = cv::imread("../images/" + name);
+                if (!img.data)
+                {
+                    cerr << "Read image " << name << " error, No Data!" << endl;
+                    continue;
+                }
+                imgs.push_back(img);
+            }
+  
+            vector<string> results;
+            
+            //Infer body
+            netInference(handle, imgs, &code, &err,&results);
+
+            if (code == 200) 
+            {
+                //Get the results of each infer. 
+                for (int i = 0; i < imgs.size(); i++)
+                    {
+                        std::cout <<results.at(i) << std::endl;
+                    }
+            } 
+            else 
+            {
+                std::cout << err << std::endl;
             }
         }
+    } 
+    else 
+    {
+        std::cout << err << std::endl;
     }
+    //release variables space
+    releaseNet(handle,&code,&err);
+    return 0;
 }
-
-template <typename C>
-void HeapArray<C>::addn_with_ids (
-     size_t nj, const T *vin, const TI *id_in,
-     long id_stride, size_t i0, long ni)
-{
-    if (id_in == nullptr) {
-        addn (nj, vin, 0, i0, ni);
-        return;
-    }
-    if (ni == -1) ni = nh;
-    assert (i0 >= 0 && i0 + ni <= nh);
-#pragma omp parallel for
-    for (size_t i = i0; i < i0 + ni; i++) {
-        T * __restrict simi = get_val(i);
-        TI * __restrict idxi = get_ids (i);
-        const T *ip_line = vin + (i - i0) * nj;
-        const TI *id_line = id_in + (i - i0) * id_stride;
-
-        for (size_t j = 0; j < nj; j++) {
-            T ip = ip_line [j];
-            if (C::cmp(simi[0], ip)) {
-                heap_pop<C> (k, simi, idxi);
-                heap_push<C> (k, simi, idxi, ip, id_line [j]);
-            }
-        }
-    }
-}
-
-template <typename C>
-void HeapArray<C>::per_line_extrema (
-                   T * out_val,
-                   TI * out_ids) const
-{
-#pragma omp parallel for
-    for (size_t j = 0; j < nh; j++) {
-        long imin = -1;
-        typename C::T xval = C::Crev::neutral ();
-        const typename C::T * x_ = val + j * k;
-        for (size_t i = 0; i < k; i++)
-            if (C::cmp (x_[i], xval)) {
-                xval = x_[i];
-                imin = i;
-            }
-        if (out_val)
-            out_val[j] = xval;
-
-        if (out_ids) {
-            if (ids && imin != -1)
-                out_ids[j] = ids [j * k + imin];
-            else
-                out_ids[j] = imin;
-        }
-    }
-}
-
-
-
-
-// explicit instanciations
-
-template struct HeapArray<CMin <float, long> >;
-template struct HeapArray<CMax <float, long> >;
-template struct HeapArray<CMin <int, long> >;
-template struct HeapArray<CMax <int, long> >;
-
-
-}  // END namespace fasis
